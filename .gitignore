@@ -1,0 +1,10 @@
+# Compiled programs and test binaries
+*.exe
+*.test
+
+# Coverage output
+*.out
+
+# SQLite files created by the demo
+*.db
+*.db-*
