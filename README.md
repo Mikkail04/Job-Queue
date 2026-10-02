@@ -1,4 +1,5 @@
 # Job Queue
+[![CI](https://github.com/Mikkail04/Job-Queue/actions/workflows/ci.yml/badge.svg)](https://github.com/Mikkail04/Job-Queue/actions/workflows/ci.yml)
 
 A small background job queue for Go. You hand it work, and a pool of workers runs it in the background, retrying anything that fails. Jobs can live in memory or in a SQLite file, so they survive restarts.
 
