@@ -1,4 +1,4 @@
-module github.com/Mikkail04/jobq
+module github.com/Mikkail04/Job-Queue
 
 go 1.26.0
 

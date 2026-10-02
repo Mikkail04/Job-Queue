@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Mikkail04/jobq"
+	"github.com/Mikkail04/Job-Queue"
 )
 
 func main() {
