@@ -1,5 +1,6 @@
-// This file decides what happens to a job after a worker takes it:
-// run the handler, then complete, retry, or dead-letter it.
+// This file decides what happens to a job after a worker takes it: run the
+// handler, then complete, retry, or dead-letter it.
+
 package jobq
 
 import (
@@ -15,24 +16,34 @@ const maxRetryDelay = 5 * time.Minute
 
 // run makes one attempt at a job, then reports the outcome to the store.
 func (q *Queue) run(ctx context.Context, job *Job) {
-	job.Attempts++          // counted before the handler runs, so the first attempt is 1
-	err := q.call(ctx, job) // run the handler; nil means success
+	job.Attempts++ // counted before the handler runs, so the first attempt is 1
+	q.emit(EventStarted, job)
+	err := q.call(ctx, job)
 	if err == nil {
-		// Tell the store it's done. logErr logs if that call fails.
-		logErr("complete", job, q.store.Complete(job))
+		q.record("complete", job, q.store.Complete(job), EventSucceeded)
 		return
 	}
-	job.LastErr = err.Error() // save the failure reason (a string, so a database can store it)
+	job.LastErr = err.Error()
 
 	// Out of attempts: dead-letter it.
 	if job.Attempts >= q.maxAttempts {
-		logErr("bury", job, q.store.Bury(job))
+		q.record("bury", job, q.store.Bury(job), EventDead)
 		return
 	}
 	// Otherwise retry later. The store gets a clock time, not a delay,
 	// because a database can save "run at 3:05:02" but not "wait 2s".
 	retryAt := time.Now().Add(q.retryDelay(job.Attempts))
-	logErr("retry", job, q.store.Retry(job, retryAt))
+	q.record("retry", job, q.store.Retry(job, retryAt), EventRetrying)
+}
+
+// record handles the result of a store call: if it failed, log it; if it
+// worked, announce the event. Events only go out for changes that really happened.
+func (q *Queue) record(op string, job *Job, err error, ev EventType) {
+	if err != nil {
+		logErr(op, job, err)
+		return
+	}
+	q.emit(ev, job)
 }
 
 // logErr reports a failed store operation instead of silently dropping it.
@@ -62,7 +73,7 @@ func (q *Queue) call(ctx context.Context, job *Job) (err error) {
 // retryDelay doubles with each attempt (capped at 5 minutes), then picks a
 // random time between half of that and the full amount. The randomness stops
 // a burst of failed jobs from all retrying at the same instant.
-// Attempt must be at least 1.
+// attempt must be at least 1.
 func (q *Queue) retryDelay(attempt int) time.Duration {
 	d := q.baseDelay << (attempt - 1) // shift left = double per attempt
 	if d <= 0 || d > maxRetryDelay {  // <= 0 catches overflow from a huge shift
