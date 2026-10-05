@@ -57,8 +57,14 @@ func run() error {
 	defer store.Close()
 
 	q := jobq.NewWithStore(store, 4, 500*time.Millisecond)
+	// if *demo {
+	// 	q.Handle("send-email", flakyEmail) // handlers must be registered before Start
+	// }
 	if *demo {
 		q.Handle("send-email", flakyEmail) // handlers must be registered before Start
+		q.Handle("always-fails", func(context.Context, []byte) error {
+			return errors.New("this job always fails")
+		})
 	}
 	apiSrv := api.New(q, store, api.Config{APIKey: apiKey, AllowedOrigin: *origin})
 	q.Start(ctx, *workers)
