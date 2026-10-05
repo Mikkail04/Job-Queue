@@ -13,6 +13,12 @@ type Queue struct {
 	// JobTimeout limits how long one attempt may run. Set it before Start.
 	JobTimeout time.Duration
 
+	// OnEvent, if set, is called whenever a job changes state. Set it before
+	// Enqueue or Start. It runs on the goroutine that caused the change, often
+	// several at once, so it must be safe for concurrent use and return
+	// quickly. A slow callback slows the workers.
+	OnEvent func(Event)
+
 	store       Store              // where jobs are saved and fetched
 	handlers    map[string]Handler // job type -> function that runs it
 	maxAttempts int                // a job is dead-lettered after this many tries
@@ -45,6 +51,7 @@ func (q *Queue) Enqueue(typ string, payload []byte) (int, error) {
 	if err := q.store.Add(job); err != nil {
 		return 0, err
 	}
+	q.emit(EventEnqueued, job)
 	return job.ID, nil
 }
 

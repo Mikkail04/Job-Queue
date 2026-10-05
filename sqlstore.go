@@ -12,21 +12,46 @@ import (
 	_ "modernc.org/sqlite" // registers the "sqlite" driver
 )
 
-// Each column matches a Job field, plus status and run_at. A row can't "move"
-// like a job in a channel, so its state is written down in status:
-// pending, running, done, or dead.
+// Each column matches a Job field, plus run_at. A row can't "move" like a job
+// in a channel, so its state is written down in status: pending, running,
+// succeeded, or dead. Times are stored as Unix milliseconds.
 const schema = `
 CREATE TABLE IF NOT EXISTS jobs (
-	id       INTEGER PRIMARY KEY AUTOINCREMENT,
-	type     TEXT    NOT NULL,
-	payload  BLOB    NOT NULL,
-	status   TEXT    NOT NULL DEFAULT 'pending',
-	attempts INTEGER NOT NULL DEFAULT 0,
-	last_err TEXT    NOT NULL DEFAULT '',
-	run_at   INTEGER NOT NULL
+	id         INTEGER PRIMARY KEY AUTOINCREMENT,
+	type       TEXT    NOT NULL,
+	payload    BLOB    NOT NULL,
+	status     TEXT    NOT NULL DEFAULT 'pending',
+	attempts   INTEGER NOT NULL DEFAULT 0,
+	last_err   TEXT    NOT NULL DEFAULT '',
+	run_at     INTEGER NOT NULL,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (status, run_at);
 `
+
+// jobColumns is the column list scanJob reads, in this exact order.
+const jobColumns = `id, type, payload, status, attempts, last_err, created_at, updated_at`
+
+// rowScanner is satisfied by both *sql.Row and *sql.Rows.
+type rowScanner interface{ Scan(dest ...any) error }
+
+// scanJob reads one row (selected with jobColumns) into a Job.
+func scanJob(r rowScanner) (*Job, error) {
+	var (
+		j                    Job
+		status               string
+		createdMS, updatedMS int64
+	)
+	err := r.Scan(&j.ID, &j.Type, &j.Payload, &status, &j.Attempts, &j.LastErr, &createdMS, &updatedMS)
+	if err != nil {
+		return nil, err
+	}
+	j.Status = Status(status)
+	j.CreatedAt = time.UnixMilli(createdMS)
+	j.UpdatedAt = time.UnixMilli(updatedMS)
+	return &j, nil
+}
 
 // SQLStore keeps jobs in a SQLite file. Use one process per file.
 type SQLStore struct {
@@ -63,8 +88,8 @@ func OpenSQLStore(path string) (*SQLStore, error) {
 // Close closes the database file.
 func (s *SQLStore) Close() error { return s.db.Close() }
 
-// Add saves a new job as pending, ready to run immediately, and sets job.ID
-// to the ID the database assigns.
+// Add saves a new job as pending, ready to run immediately, and fills in
+// job.ID, job.Status, and the timestamps.
 func (s *SQLStore) Add(job *Job) error {
 	// The payload column is NOT NULL, but the driver stores a nil slice as
 	// NULL. Swap in an empty slice so jobs with no payload can be saved.
@@ -73,23 +98,28 @@ func (s *SQLStore) Add(job *Job) error {
 		payload = []byte{}
 	}
 
+	nowMS := time.Now().UnixMilli()
+
 	// The ? placeholders keep values separate from the SQL, which prevents
 	// injection. status and attempts are left out so they take their defaults
 	// ('pending' and 0), and run_at is now so the job is ready immediately.
 	res, err := s.db.Exec(
-		`INSERT INTO jobs (type, payload, run_at) VALUES (?, ?, ?)`,
-		job.Type, payload, time.Now().UnixMilli(),
+		`INSERT INTO jobs (type, payload, run_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		job.Type, payload, nowMS, nowMS, nowMS,
 	)
 	if err != nil {
 		return err
 	}
 
-	// Write the new row's ID onto job so Enqueue can return it.
+	// Write the new row's details onto job so Enqueue can return them.
 	id, err := res.LastInsertId()
 	if err != nil {
 		return err
 	}
 	job.ID = int(id)
+	job.Status = StatusPending
+	job.CreatedAt = time.UnixMilli(nowMS)
+	job.UpdatedAt = job.CreatedAt
 	return nil
 }
 
@@ -109,7 +139,7 @@ func (s *SQLStore) Next(ctx context.Context) (*Job, error) {
 		}
 
 		// ErrNoRows just means nothing is ready, which is normal. Anything
-		// else is a real database problem: log it and keep going, so a
+		// else is a real database problem: log it and keep going, so one
 		// temporary error doesn't kill the worker.
 		if !errors.Is(err, sql.ErrNoRows) {
 			slog.Error("claiming a job failed", "err", err)
@@ -127,24 +157,21 @@ func (s *SQLStore) Next(ctx context.Context) (*Job, error) {
 // claim marks one ready job as running and returns it, in a single statement.
 // Doing it in one statement is what stops two workers from grabbing the same job.
 func (s *SQLStore) claim(ctx context.Context) (*Job, error) {
-	var job Job
+	nowMS := time.Now().UnixMilli()
 	// Inside out: the SELECT finds the oldest due pending job, the UPDATE marks
 	// it running, and RETURNING hands its columns back.
-	err := s.db.QueryRowContext(ctx, `
-		UPDATE jobs SET status = 'running'
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE jobs SET status = 'running', updated_at = ?
 		WHERE id = (
 			SELECT id FROM jobs
 			WHERE status = 'pending' AND run_at <= ?
 			ORDER BY run_at, id
 			LIMIT 1
 		)
-		RETURNING id, type, payload, attempts, last_err`,
-		time.Now().UnixMilli(),
-	).Scan(&job.ID, &job.Type, &job.Payload, &job.Attempts, &job.LastErr)
-	if err != nil {
-		return nil, err // sql.ErrNoRows when nothing is ready
-	}
-	return &job, nil
+		RETURNING `+jobColumns,
+		nowMS, nowMS,
+	)
+	return scanJob(row) // sql.ErrNoRows when nothing is ready
 }
 
 // Compile-time check that SQLStore satisfies Store.
@@ -153,8 +180,8 @@ var _ Store = (*SQLStore)(nil)
 // Complete marks a job as finished. The row is kept as a record.
 func (s *SQLStore) Complete(job *Job) error {
 	_, err := s.db.Exec(
-		`UPDATE jobs SET status = 'done', attempts = ? WHERE id = ?`,
-		job.Attempts, job.ID,
+		`UPDATE jobs SET status = 'succeeded', attempts = ?, updated_at = ? WHERE id = ?`,
+		job.Attempts, time.Now().UnixMilli(), job.ID,
 	)
 	return err
 }
@@ -163,17 +190,17 @@ func (s *SQLStore) Complete(job *Job) error {
 // No timer is needed: claim skips rows whose run_at is still in the future.
 func (s *SQLStore) Retry(job *Job, at time.Time) error {
 	_, err := s.db.Exec(
-		`UPDATE jobs SET status = 'pending', attempts = ?, last_err = ?, run_at = ? WHERE id = ?`,
-		job.Attempts, job.LastErr, at.UnixMilli(), job.ID,
+		`UPDATE jobs SET status = 'pending', attempts = ?, last_err = ?, run_at = ?, updated_at = ? WHERE id = ?`,
+		job.Attempts, job.LastErr, at.UnixMilli(), time.Now().UnixMilli(), job.ID,
 	)
 	return err
 }
 
-// Bury moves a job to the dead-letter state once it has used up all its attempts.
+// Bury marks a job as dead: it ran out of attempts and will never run again.
 func (s *SQLStore) Bury(job *Job) error {
 	_, err := s.db.Exec(
-		`UPDATE jobs SET status = 'dead', attempts = ?, last_err = ? WHERE id = ?`,
-		job.Attempts, job.LastErr, job.ID,
+		`UPDATE jobs SET status = 'dead', attempts = ?, last_err = ?, updated_at = ? WHERE id = ?`,
+		job.Attempts, job.LastErr, time.Now().UnixMilli(), job.ID,
 	)
 	return err
 }
@@ -182,7 +209,7 @@ func (s *SQLStore) Bury(job *Job) error {
 // no error return, so failures are logged and the result may be incomplete.
 func (s *SQLStore) Dead() []Job {
 	rows, err := s.db.Query(
-		`SELECT id, type, payload, attempts, last_err FROM jobs WHERE status = 'dead' ORDER BY id`,
+		`SELECT ` + jobColumns + ` FROM jobs WHERE status = 'dead' ORDER BY id`,
 	)
 	if err != nil {
 		slog.Error("listing dead jobs failed", "err", err)
@@ -196,12 +223,12 @@ func (s *SQLStore) Dead() []Job {
 	// we have so far.
 	var out []Job
 	for rows.Next() {
-		var j Job
-		if err := rows.Scan(&j.ID, &j.Type, &j.Payload, &j.Attempts, &j.LastErr); err != nil {
+		j, err := scanJob(rows)
+		if err != nil {
 			slog.Error("reading a dead job failed", "err", err)
 			return out
 		}
-		out = append(out, j)
+		out = append(out, *j)
 	}
 
 	// rows.Next also returns false when something went wrong, not only at the

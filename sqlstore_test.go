@@ -196,3 +196,25 @@ func TestSQLStoreDeadLettersPersist(t *testing.T) {
 		t.Fatalf("unexpected dead letters after reopen: %+v", dead)
 	}
 }
+
+// Add and Next fill in each job's status and timestamps.
+func TestSQLStoreSetsStatusAndTimes(t *testing.T) {
+	s := openTestStore(t, filepath.Join(t.TempDir(), "jobs.db"))
+	job := &Job{Type: "x"}
+	if err := s.Add(job); err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != StatusPending || job.CreatedAt.IsZero() {
+		t.Fatalf("after Add: %+v", job)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	got, err := s.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusRunning || got.CreatedAt.IsZero() || got.UpdatedAt.Before(got.CreatedAt) {
+		t.Fatalf("after Next: %+v", got)
+	}
+}
